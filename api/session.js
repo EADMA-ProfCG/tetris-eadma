@@ -1,27 +1,60 @@
-const { kv } = require('@vercel/kv');
-const { randomUUID } = require('crypto');
+const { Redis } = require('@upstash/redis');
+const redis = new Redis({
+  url: process.env.UPSTASH_REDIS_REST_URL,
+  token: process.env.UPSTASH_REDIS_REST_TOKEN,
+});
+function parseVal(v){try{return typeof v==='string'?JSON.parse(v):v;}catch(e){return v;}}
+
+const PTS = [0, 100, 300, 500, 800];
 
 module.exports = async function handler(req, res) {
-  if (req.method !== 'POST') return res.status(405).json({ ok: false });
+  res.setHeader('Access-Control-Allow-Origin', '*');
 
-  const { name, category } = req.body || {};
-  if (!name || !category) return res.json({ ok: false, error: 'Datos incompletos' });
-
-  // Verificar si el jugador está baneado
-  const banRaw = await kv.hget('banned', name.toLowerCase());
-  if (banRaw) {
-    const ban = typeof banRaw === 'string' ? JSON.parse(banRaw) : banRaw;
-    if (!ban.until || ban.until > Date.now()) {
-      const horas = ban.until ? Math.max(1, Math.ceil((ban.until - Date.now()) / 3600000)) : 24;
-      return res.json({ ok: false, banned: true, error: `Tu acceso está bloqueado temporalmente (~${horas}h). Motivo: ${ban.reason || 'trampa detectada'}.` });
-    }
-    // Ban expirado: limpiar
-    await kv.hdel('banned', name.toLowerCase());
+  if (req.method === 'GET') {
+    const raw = await redis.hgetall('scores') || {};
+    const scores = {};
+    for (const [k, v] of Object.entries(raw)) scores[k] = parseVal(v);
+    return res.json({ ok: true, scores });
   }
 
-  const token = randomUUID();
-  const session = { name, category, score: 0, lines: 0, level: 1, startedAt: Date.now() };
-  await kv.set(`session:${token}`, JSON.stringify(session), { ex: 7200 }); // TTL 2h
+  if (req.method === 'POST') {
+    const { name, sessionToken } = req.body || {};
+    if (!name || !sessionToken) return res.json({ ok: false, error: 'Datos incompletos' });
 
-  return res.json({ ok: true, token });
+    const rawSession = await redis.get(`session:${sessionToken}`);
+    if (!rawSession) return res.json({ ok: false, error: 'Sesión inválida o expirada' });
+
+    const session = parseVal(rawSession);
+    if (session.name.toLowerCase() !== name.toLowerCase())
+      return res.json({ ok: false, error: 'El nombre no coincide con la sesión' });
+
+    const duration = Date.now() - session.startedAt;
+    const finalScore = session.score;
+
+    const prevRaw = await redis.hget('scores', name);
+    const prev = parseVal(prevRaw);
+    const prevScore = prev?.score ?? (typeof prev === 'number' ? prev : 0);
+
+    let updated = false;
+    if (finalScore > prevScore) {
+      const entry = {
+        score: finalScore, lines: session.lines || 0, level: session.level || 1,
+        category: session.category, duration, at: new Date().toISOString()
+      };
+      await redis.hset('scores', { [name]: JSON.stringify(entry) });
+      updated = true;
+
+      const pps = finalScore / (duration / 1000);
+      if (pps > 200 && duration > 5000) {
+        const suspEntry = { name, score: finalScore, lines: session.lines, level: session.level,
+          duration, reason: `Puntaje por segundo elevado: ${pps.toFixed(1)} pts/s`, at: entry.at };
+        await redis.lpush('suspicious', JSON.stringify(suspEntry));
+      }
+    }
+
+    await redis.del(`session:${sessionToken}`);
+    return res.json({ ok: true, updated, score: finalScore, best: Math.max(prevScore, finalScore) });
+  }
+
+  return res.status(405).json({ ok: false });
 };
